@@ -1,0 +1,486 @@
+#!/usr/bin/env bash
+# Must be run directly, not sourced — sourcing would expose every internal
+# helper (get_password, set_pin, ensure_configured, ...) as a callable
+# command with none of the checks the dispatch below normally enforces.
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+  echo "fastvpn: run this script directly (e.g. 'fastvpn up la') — it refuses to be sourced." >&2
+  return 1 2>/dev/null || exit 1
+fi
+
+set -euo pipefail
+
+CONF_DIR="$HOME/.config/fastvpn"
+LOCATIONS_FILE="$CONF_DIR/locations.conf"
+USERNAME_FILE="$CONF_DIR/username"
+OVPN_DIR="/etc/openvpn/client/udp"
+DEFAULT=slc
+
+# FastVPN password is stored in `pass`, encrypted to a GPG key whose sole
+# purpose is this password and whose passphrase is the user's PIN.
+PASS_ENTRY="fastvpn"
+GPG_UID="FastVPN key (do not use for anything else) <fastvpn@local>"
+
+declare -A COUNTRY_NAMES=(
+  [US]="United States" [UK]="United Kingdom" [AU]="Australia" [CA]="Canada"
+  [FR]="France" [JP]="Japan" [ES]="Spain" [DE]="Germany" [ZA]="South Africa"
+  [VN]="Vietnam" [VE]="Venezuela" [UY]="Uruguay" [UA]="Ukraine" [TW]="Taiwan"
+  [TT]="Trinidad and Tobago" [TR]="Turkey" [TH]="Thailand" [SK]="Slovakia"
+  [SI]="Slovenia" [SG]="Singapore" [SE]="Sweden" [SA]="Saudi Arabia"
+  [RS]="Serbia" [RO]="Romania" [PY]="Paraguay" [PT]="Portugal"
+  [PR]="Puerto Rico" [PL]="Poland" [PK]="Pakistan" [PH]="Philippines"
+  [PG]="Papua New Guinea" [PE]="Peru" [PA]="Panama" [NZ]="New Zealand"
+  [NP]="Nepal" [NO]="Norway" [NL]="Netherlands" [NI]="Nicaragua"
+  [NG]="Nigeria" [MY]="Malaysia" [MX]="Mexico" [MT]="Malta" [MO]="Macau"
+  [MN]="Mongolia" [MM]="Myanmar" [MK]="North Macedonia" [ME]="Montenegro"
+  [MD]="Moldova" [MC]="Monaco" [MA]="Morocco" [LV]="Latvia" [LU]="Luxembourg"
+  [LT]="Lithuania" [LK]="Sri Lanka" [LI]="Liechtenstein" [LB]="Lebanon"
+  [LA]="Laos" [KZ]="Kazakhstan" [KY]="Cayman Islands" [KR]="South Korea"
+  [KH]="Cambodia" [KE]="Kenya" [JO]="Jordan" [JM]="Jamaica" [JE]="Jersey"
+  [IT]="Italy" [IS]="Iceland" [IN]="India" [IM]="Isle of Man" [IL]="Israel"
+  [IE]="Ireland" [ID]="Indonesia" [HU]="Hungary" [HT]="Haiti" [HR]="Croatia"
+  [HN]="Honduras" [HK]="Hong Kong" [GT]="Guatemala" [GR]="Greece"
+  [GH]="Ghana" [GE]="Georgia" [FI]="Finland" [EG]="Egypt" [EE]="Estonia"
+  [EC]="Ecuador" [DZ]="Algeria" [DO]="Dominican Republic" [DK]="Denmark"
+  [CZ]="Czechia" [CY]="Cyprus" [CR]="Costa Rica" [CO]="Colombia"
+  [CL]="Chile" [CH]="Switzerland" [BZ]="Belize" [BT]="Bhutan"
+  [BS]="Bahamas" [BR]="Brazil" [BO]="Bolivia" [BN]="Brunei" [BM]="Bermuda"
+  [BG]="Bulgaria" [BE]="Belgium" [BD]="Bangladesh" [BA]="Bosnia and Herzegovina"
+  [AZ]="Azerbaijan" [AT]="Austria" [AR]="Argentina" [AM]="Armenia"
+  [AL]="Albania" [AE]="United Arab Emirates" [AD]="Andorra"
+)
+
+mkdir -p "$CONF_DIR"
+if [[ ! -f "$LOCATIONS_FILE" ]]; then
+  cat > "$LOCATIONS_FILE" <<'EOF'
+slc=NCVPN-US-Salt Lake City-UDP
+la=NCVPN-US-Los Angeles-UDP
+EOF
+fi
+declare -A CONNS=()
+while IFS='=' read -r key name; do
+  [[ -z "$key" || "$key" == \#* ]] && continue
+  CONNS["$key"]="$name"
+done < "$LOCATIONS_FILE"
+
+active() { nmcli -t -f NAME connection show --active | grep -qxF "$1"; }
+
+# name of whichever known (already-configured) connection is currently active
+current_active() {
+  local key name
+  for key in "${!CONNS[@]}"; do
+    name="${CONNS[$key]}"
+    if active "$name"; then echo "$name"; return 0; fi
+  done
+  return 1
+}
+
+resolve() {
+  local key="$1"
+  if [[ -n "${CONNS[$key]:-}" ]]; then
+    echo "${CONNS[$key]}"
+  else
+    echo "fastvpn: unknown location '$key' (known: ${!CONNS[*]})" >&2
+    exit 1
+  fi
+}
+
+get_username() {
+  if [[ -s "$USERNAME_FILE" ]]; then
+    cat "$USERNAME_FILE"
+  else
+    echo "fastvpn: no username set — run 'fastvpn set-username <your-fastvpn-username>'" >&2
+    exit 1
+  fi
+}
+
+set_username() {
+  local u="${1:?usage: fastvpn set-username <username>}"
+  printf '%s' "$u" > "$USERNAME_FILE"
+  echo "fastvpn: username set to '$u'"
+}
+
+pass_store_dir() { echo "${PASSWORD_STORE_DIR:-$HOME/.password-store}"; }
+pass_initialized() { [[ -f "$(pass_store_dir)/.gpg-id" ]]; }
+entry_exists() { [[ -f "$(pass_store_dir)/$PASS_ENTRY.gpg" ]]; }
+
+# gpg needs allow-loopback-pinentry so we can feed the PIN via --passphrase-fd
+# ourselves instead of a separate pinentry popup asking for it.
+ensure_loopback_pinentry() {
+  local conf="$HOME/.gnupg/gpg-agent.conf"
+  mkdir -p "$HOME/.gnupg"; chmod 700 "$HOME/.gnupg"
+  if [[ ! -f "$conf" ]] || ! grep -qx 'allow-loopback-pinentry' "$conf"; then
+    echo 'allow-loopback-pinentry' >> "$conf"
+    gpgconf --kill gpg-agent 2>/dev/null || true
+  fi
+}
+
+key_fpr() {
+  gpg --list-secret-keys --with-colons "$GPG_UID" 2>/dev/null \
+    | awk -F: '/^fpr:/{print $10; exit}'
+}
+
+# keygrip of the encryption SUBKEY (not the primary key) — this is what
+# actually needs unlocking to decrypt a `pass` entry
+subkey_grip() {
+  gpg --list-secret-keys --with-colons --with-keygrip "$GPG_UID" 2>/dev/null \
+    | awk -F: '/^ssb:/{f=1} f && /^grp:/{print $10; exit}'
+}
+
+# gpg-agent caches an unlocked key for a while; without forgetting it first,
+# a *wrong* PIN would still succeed on a second attempt within that window.
+# Force a fresh check every time by dropping the cache for just this subkey.
+forget_cached_pin() {
+  local grip; grip="$(subkey_grip)"
+  [[ -n "$grip" ]] && gpg-connect-agent "clear_passphrase --mode=normal $grip" /bye >/dev/null 2>&1 || true
+}
+
+set_pin() {
+  local force="${1:-}"
+  if pass_initialized && [[ "$force" != "--force" ]]; then
+    echo "fastvpn: a PIN is already set." >&2
+    echo "fastvpn: to change it, run: fastvpn set-pin --force" >&2
+    echo "fastvpn:   (this deletes the old key and stored password — you'll need to run 'fastvpn set-password' again)" >&2
+    exit 1
+  fi
+
+  local pin pin2
+  read -rs -p "New PIN: " pin; echo
+  read -rs -p "Confirm PIN: " pin2; echo
+  [[ -z "$pin" ]] && { echo "fastvpn: empty PIN, aborting" >&2; exit 1; }
+  [[ "$pin" != "$pin2" ]] && { echo "fastvpn: PINs didn't match, aborting" >&2; exit 1; }
+
+  ensure_loopback_pinentry
+
+  if [[ "$force" == "--force" ]]; then
+    local old_fpr; old_fpr="$(key_fpr)"
+    [[ -n "$old_fpr" ]] && gpg --batch --yes --delete-secret-and-public-key "$old_fpr" >/dev/null 2>&1
+    rm -rf "$(pass_store_dir)"
+  fi
+
+  printf '%s\n' "$pin" | gpg --batch --pinentry-mode loopback --passphrase-fd 0 \
+    --quick-generate-key "$GPG_UID" default default never 2>/dev/null
+
+  local fpr; fpr="$(key_fpr)"
+  [[ -z "$fpr" ]] && { echo "fastvpn: failed to generate GPG key" >&2; exit 1; }
+  pass init "$fpr" >/dev/null
+
+  echo "fastvpn: PIN set. Now run 'fastvpn set-password' to store your FastVPN password."
+}
+
+set_password() {
+  pass_initialized || { echo "fastvpn: no PIN set yet — run 'fastvpn set-pin' first" >&2; exit 1; }
+  local pw
+  read -rs -p "FastVPN password: " pw; echo
+  [[ -z "$pw" ]] && { echo "fastvpn: empty password, not saving" >&2; exit 1; }
+  printf '%s\n' "$pw" | pass insert -e -f "$PASS_ENTRY" >/dev/null
+  echo "fastvpn: FastVPN password stored, protected by your PIN."
+}
+
+# prompts for the PIN and returns the decrypted FastVPN password on stdout;
+# all prompts/errors go to stderr so callers can safely capture the output
+get_password() {
+  pass_initialized || { echo "fastvpn: no PIN set yet — run 'fastvpn set-pin' first" >&2; exit 1; }
+  entry_exists || { echo "fastvpn: no password stored yet — run 'fastvpn set-password' first" >&2; exit 1; }
+  ensure_loopback_pinentry
+  forget_cached_pin
+
+  local pin pw
+  read -rs -p "PIN: " pin
+  echo >&2
+  [[ -z "$pin" ]] && { echo "fastvpn: empty PIN" >&2; exit 1; }
+
+  pw="$(printf '%s' "$pin" \
+    | PASSWORD_STORE_GPG_OPTS="--batch --yes --pinentry-mode loopback --passphrase-fd 0" \
+      pass show "$PASS_ENTRY" 2>/dev/null)"
+  [[ -z "$pw" ]] && { echo "fastvpn: wrong PIN" >&2; exit 1; }
+  printf '%s' "$pw"
+}
+
+# "Country — City" label for a bare NCVPN-XX-City-UDP filename (no extension)
+describe() {
+  local base="$1" cc city
+  if [[ "$base" =~ ^NCVPN-([A-Za-z]{2})-(.*)-(UDP|TCP)$ ]]; then
+    cc="${BASH_REMATCH[1]}"; city="${BASH_REMATCH[2]}"
+    echo "${COUNTRY_NAMES[$cc]:-$cc} — $city"
+  else
+    echo "$base"
+  fi
+}
+
+# search the full 151-file catalog by substring against country/city label
+# or the raw filename; prints matching base names (one per line)
+catalog_search() {
+  local q="${1,,}" f base label
+  for f in "$OVPN_DIR"/*.ovpn; do
+    base="$(basename "$f" .ovpn)"
+    label="$(describe "$base")"
+    if [[ "${label,,}" == *"$q"* || "${base,,}" == *"$q"* ]]; then
+      echo "$base"
+    fi
+  done
+}
+
+derive_alias() {
+  sed -E 's/^NCVPN-[A-Za-z]{2}-//; s/-(UDP|TCP)$//' <<<"$1" \
+    | tr '[:upper:]' '[:lower:]' | tr -dc 'a-z0-9'
+}
+
+# lazily import + configure a catalog entry (by exact base filename) the
+# first time it's used; no-op (just prints its name) if already configured.
+# optional $2 overrides the auto-derived alias.
+ensure_configured() {
+  local base="$1" override="${2:-}" name file k alias_key
+  name="$base"
+  file="$OVPN_DIR/$base.ovpn"
+
+  for k in "${!CONNS[@]}"; do
+    if [[ "${CONNS[$k]}" == "$name" ]]; then echo "$name"; return 0; fi
+  done
+
+  [[ -f "$file" ]] || { echo "fastvpn: no such config: $file" >&2; exit 1; }
+
+  # ask for the PIN now, before touching NetworkManager, so a wrong PIN
+  # or missing setup fails cleanly without leaving a half-imported connection
+  local vpn_pw; vpn_pw="$(get_password)" || exit 1
+
+  if ! nmcli -t -f NAME connection show | grep -qxF "$name"; then
+    nmcli connection import type openvpn file "$file" >/dev/null
+  fi
+  nmcli connection modify "$name" +vpn.data password-flags=0
+  nmcli connection modify "$name" +vpn.data "username=$(get_username)"
+  nmcli connection modify "$name" vpn.secrets "password=$vpn_pw"
+  unset vpn_pw
+
+  if [[ -n "$override" ]]; then
+    if [[ -n "${CONNS[$override]:-}" && "${CONNS[$override]}" != "$name" ]]; then
+      echo "fastvpn: alias '$override' already points to '${CONNS[$override]}'" >&2
+      exit 1
+    fi
+    alias_key="$override"
+  else
+    alias_key="$(derive_alias "$name")"
+    local i=2 try="$alias_key"
+    while [[ -n "${CONNS[$try]:-}" ]]; do try="${alias_key}${i}"; ((i++)); done
+    alias_key="$try"
+  fi
+
+  echo "$alias_key=$name" >> "$LOCATIONS_FILE"
+  CONNS["$alias_key"]="$name"
+  echo "fastvpn: configured '$alias_key' -> $name" >&2
+  echo "$name"
+}
+
+# resolve a user-typed location: known alias, exact catalog filename, or a
+# free-text search across the whole catalog (lazily configuring on first use)
+resolve_or_add() {
+  local query="$1"
+  if [[ -n "${CONNS[$query]:-}" ]]; then
+    echo "${CONNS[$query]}"; return 0
+  fi
+  if [[ -f "$OVPN_DIR/$query.ovpn" ]]; then
+    ensure_configured "$query"; return 0
+  fi
+  local matches=() m
+  while IFS= read -r m; do matches+=("$m"); done < <(catalog_search "$query")
+  if [[ ${#matches[@]} -eq 0 ]]; then
+    echo "fastvpn: no location matches '$query'" >&2
+    exit 1
+  elif [[ ${#matches[@]} -gt 1 ]]; then
+    echo "fastvpn: multiple matches for '$query', be more specific:" >&2
+    for m in "${matches[@]}"; do echo "  $(describe "$m")  [$m]" >&2; done
+    echo "fastvpn: or browse them all with: fastvpn pick" >&2
+    exit 1
+  fi
+  ensure_configured "${matches[0]}"
+}
+
+add_location() {
+  local search="${1:?usage: fastvpn add <search-term> [alias]}"
+  local alias_key="${2:-}"
+  local base
+  if [[ -n "${CONNS[$search]:-}" ]]; then
+    echo "fastvpn: '$search' already configured -> ${CONNS[$search]}"
+    return 0
+  elif [[ -f "$OVPN_DIR/$search.ovpn" ]]; then
+    base="$search"
+  else
+    local matches=() m
+    while IFS= read -r m; do matches+=("$m"); done < <(catalog_search "$search")
+    if [[ ${#matches[@]} -eq 0 ]]; then
+      echo "fastvpn: no matches for '$search'" >&2; exit 1
+    elif [[ ${#matches[@]} -gt 1 ]]; then
+      echo "fastvpn: multiple matches for '$search', be more specific:" >&2
+      for m in "${matches[@]}"; do echo "  $(describe "$m")  [$m]" >&2; done
+      exit 1
+    fi
+    base="${matches[0]}"
+  fi
+  ensure_configured "$base" "$alias_key" >/dev/null
+  echo "Use: fastvpn up $(derive_alias "$base")   (see 'fastvpn list' for the actual alias used)"
+}
+
+# interactive fuzzy picker over the whole 151-server catalog; prints the
+# chosen base filename, or exits nonzero if fzf isn't installed / nothing picked
+pick_interactive() {
+  command -v fzf >/dev/null 2>&1 || {
+    echo "fastvpn: fzf not installed — run 'sudo apt install fzf', or use 'fastvpn up <search-term>' instead" >&2
+    exit 1
+  }
+  local f base chosen
+  chosen="$(
+    for f in "$OVPN_DIR"/*.ovpn; do
+      base="$(basename "$f" .ovpn)"
+      printf '%s\t%s\n' "$(describe "$base")" "$base"
+    done | sort | fzf --with-nth=1 --delimiter=$'\t' --prompt='VPN location> ' | cut -f2
+  )"
+  [[ -z "$chosen" ]] && { echo "fastvpn: nothing selected" >&2; exit 1; }
+  echo "$chosen"
+}
+
+print_status() {
+  if active "$conn"; then echo "$conn up ($(curl -s --max-time 5 https://ifconfig.co))"
+  else echo "$conn down"; fi
+}
+
+usage() {
+  cat <<'EOF'
+fastvpn — connect to Namecheap FastVPN locations via NetworkManager
+
+USAGE
+  fastvpn [command] [location]
+
+COMMANDS
+  up [location]          Connect. With no location: resumes whatever's
+                          currently active, opens the fzf picker if fzf is
+                          installed, or else prints a usage hint.
+                          <location> is a saved alias (la, slc, ...) or a
+                          free-text search across all servers by city or
+                          country name/code (e.g. germany, "san jose").
+                          First use of a new location auto-imports + configures
+                          it, prompting for your PIN (see 'set-pin'); reusing
+                          an already-configured one never prompts. Ambiguous
+                          searches list candidates instead of guessing. Brings
+                          down any other active connection first, so only one
+                          tunnel is ever up.
+  on [location]           Alias for 'up'.
+
+  down                    Disconnect the current connection.
+  off                     Alias for 'down'.
+
+  toggle [location]       Connect if down, disconnect if up. This is the
+                          default when no command is given at all. With no
+                          location: acts on whatever's active, else 'slc'.
+
+  status [location]       Show up/down and the current public IP.
+                          Default location: whatever's active, else 'slc'.
+
+  pick                    Open an interactive fuzzy picker (fzf) over every
+                          server in the catalog and connect to the choice.
+                          Requires: sudo apt install fzf
+
+  list                    List configured aliases and what they point to.
+
+  add <search> [alias]    Pre-configure a location (import + credentials)
+                          without connecting to it. <search> matches a
+                          saved alias, an exact config filename, or free
+                          text same as 'up'. Give [alias] to pick your own
+                          short name instead of the auto-derived one.
+                          Prompts for your PIN only if this particular
+                          location isn't configured yet.
+
+  set-pin [--force]       First-time setup: choose a PIN (typed twice) and
+                          generate a dedicated GPG key protected by it,
+                          then initialize the `pass` store with that key.
+                          Run once before 'set-password'. Refuses to run
+                          again unless given --force, which deletes the
+                          old key AND the stored password (you'll need to
+                          run 'fastvpn set-password' again afterwards).
+
+  set-password            Prompt (hidden input) for your FastVPN password
+                          and store it via `pass`, encrypted to the key
+                          from 'set-pin'. Requires 'fastvpn set-pin' first.
+
+  set-username <name>     Set your FastVPN service username (not secret —
+                          stored in plain text at ~/.config/fastvpn/username).
+
+  help, -h, --help        Show this help.
+
+EXAMPLES
+  fastvpn set-pin              one-time: choose your PIN
+  fastvpn set-password         one-time: store the FastVPN password
+  fastvpn set-username you@namecheap   one-time (defaults to the current account)
+  fastvpn                      toggle the current/default connection
+  fastvpn up la                connect to Los Angeles
+  fastvpn up germany           search the catalog; lists matches if ambiguous
+  fastvpn pick                 fuzzy-pick from the whole catalog
+  fastvpn add "las vegas"      configure Las Vegas without connecting
+  fastvpn down
+  fastvpn status
+
+FILES
+  ~/.config/fastvpn/locations.conf   alias=ConnectionName pairs
+  ~/.config/fastvpn/username         FastVPN username (plain text, not secret)
+  ~/.password-store/fastvpn.gpg  FastVPN password, GPG-encrypted, PIN-locked
+EOF
+}
+
+# for down/toggle/status with no location given: whatever's active, else DEFAULT
+default_conn() {
+  local c; c="$(current_active || true)"
+  [[ -z "$c" ]] && c="$(resolve "$DEFAULT")"
+  echo "$c"
+}
+
+action="${1:-toggle}"
+loc="${2:-}"
+
+case "$action" in
+  help|-h|--help) usage; exit 0 ;;
+  add)          add_location "${2:-}" "${3:-}"; exit 0 ;;
+  set-pin)      set_pin "${2:-}"; exit 0 ;;
+  set-password) set_password; exit 0 ;;
+  set-username) set_username "${2:-}"; exit 0 ;;
+  list)
+    for key in "${!CONNS[@]}"; do printf '%s -> %s\n' "$key" "${CONNS[$key]}"; done
+    exit 0 ;;
+esac
+
+case "$action" in
+  up|on|pick)
+    if [[ "$action" == "pick" ]]; then
+      loc="$(pick_interactive)"
+    elif [[ -z "$loc" ]]; then
+      if command -v fzf >/dev/null 2>&1; then
+        loc="$(pick_interactive)"
+      else
+        echo "fastvpn: 'fastvpn up' needs a search term, or install fzf to browse (sudo apt install fzf). See 'fastvpn help'." >&2
+        exit 1
+      fi
+    fi
+    conn="$(resolve_or_add "$loc")"
+    other="$(current_active || true)"
+    if [[ -n "$other" && "$other" != "$conn" ]]; then
+      nmcli connection down "$other"
+    fi
+    active "$conn" || nmcli connection up "$conn"
+    print_status ;;
+  down|off)
+    conn="$([[ -n "$loc" ]] && resolve_or_add "$loc" || default_conn)"
+    nmcli connection down "$conn" ;;
+  toggle)
+    conn="$([[ -n "$loc" ]] && resolve_or_add "$loc" || default_conn)"
+    if active "$conn"; then
+      nmcli connection down "$conn"
+    else
+      other="$(current_active || true)"
+      [[ -n "$other" && "$other" != "$conn" ]] && nmcli connection down "$other"
+      nmcli connection up "$conn"
+    fi
+    print_status ;;
+  status)
+    conn="$([[ -n "$loc" ]] && resolve_or_add "$loc" || default_conn)"
+    print_status ;;
+  *)
+    usage >&2
+    exit 1 ;;
+esac
