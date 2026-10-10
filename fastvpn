@@ -84,6 +84,28 @@ resolve() {
   fi
 }
 
+# undo what ensure_configured did: delete the NetworkManager connection and
+# forget the alias. Also the fix for a connection that got registered but
+# whose 'nmcli connection up' later failed (e.g. bad password at the time) —
+# there was previously no way to clean that up.
+remove_location() {
+  local key="${1:?usage: fastvpn remove <alias>}"
+  local name="${CONNS[$key]:-}"
+  [[ -n "$name" ]] || {
+    echo "fastvpn: unknown location '$key' (known: ${!CONNS[*]})" >&2
+    exit 1
+  }
+
+  active "$name" && nmcli connection down "$name" >/dev/null 2>&1
+  nmcli connection delete "$name" >/dev/null 2>&1
+
+  local tmp; tmp="$(mktemp)"
+  grep -vxF "$key=$name" "$LOCATIONS_FILE" > "$tmp"
+  mv "$tmp" "$LOCATIONS_FILE"
+
+  echo "fastvpn: removed '$key' ($name) — NetworkManager connection deleted, alias forgotten"
+}
+
 get_username() {
   if [[ -s "$USERNAME_FILE" ]]; then
     cat "$USERNAME_FILE"
@@ -100,8 +122,16 @@ set_username() {
 }
 
 pass_store_dir() { echo "${PASSWORD_STORE_DIR:-$HOME/.password-store}"; }
-pass_initialized() { [[ -f "$(pass_store_dir)/.gpg-id" ]]; }
 entry_exists() { [[ -f "$(pass_store_dir)/$PASS_ENTRY.gpg" ]]; }
+
+# NOT "does a pass store exist" — that store may be shared with unrelated
+# secrets (other keys, other entries) that predate or sit alongside ours.
+# This checks specifically that OUR dedicated key exists and is the store's
+# current default recipient, independent of anything else living in there.
+fastvpn_key_ready() {
+  local fpr; fpr="$(key_fpr)"
+  [[ -n "$fpr" && "$(cat "$(pass_store_dir)/.gpg-id" 2>/dev/null)" == "$fpr" ]]
+}
 
 # gpg needs allow-loopback-pinentry so we can feed the PIN via --passphrase-fd
 # ourselves instead of a separate pinentry popup asking for it.
@@ -136,7 +166,7 @@ forget_cached_pin() {
 
 set_pin() {
   local force="${1:-}"
-  if pass_initialized && [[ "$force" != "--force" ]]; then
+  if fastvpn_key_ready && [[ "$force" != "--force" ]]; then
     echo "fastvpn: a PIN is already set." >&2
     echo "fastvpn: to change it, run: fastvpn set-pin --force" >&2
     echo "fastvpn:   (this deletes the old key and stored password — you'll need to run 'fastvpn set-password' again)" >&2
@@ -154,7 +184,8 @@ set_pin() {
   if [[ "$force" == "--force" ]]; then
     local old_fpr; old_fpr="$(key_fpr)"
     [[ -n "$old_fpr" ]] && gpg --batch --yes --delete-secret-and-public-key "$old_fpr" >/dev/null 2>&1
-    rm -rf "$(pass_store_dir)"
+    # remove only OUR entry — the store may hold other, unrelated secrets
+    rm -f "$(pass_store_dir)/$PASS_ENTRY.gpg"
   fi
 
   printf '%s\n' "$pin" | gpg --batch --pinentry-mode loopback --passphrase-fd 0 \
@@ -162,13 +193,17 @@ set_pin() {
 
   local fpr; fpr="$(key_fpr)"
   [[ -z "$fpr" ]] && { echo "fastvpn: failed to generate GPG key" >&2; exit 1; }
-  pass init "$fpr" >/dev/null
+  # set .gpg-id directly rather than `pass init`, which walks the whole
+  # store re-encrypting every existing entry to the new key — risky if
+  # other entries live here under a different key entirely.
+  mkdir -p "$(pass_store_dir)"
+  printf '%s\n' "$fpr" > "$(pass_store_dir)/.gpg-id"
 
   echo "fastvpn: PIN set. Now run 'fastvpn set-password' to store your FastVPN password."
 }
 
 set_password() {
-  pass_initialized || { echo "fastvpn: no PIN set yet — run 'fastvpn set-pin' first" >&2; exit 1; }
+  fastvpn_key_ready || { echo "fastvpn: no PIN set yet — run 'fastvpn set-pin' first" >&2; exit 1; }
   local pw
   read -rs -p "FastVPN password: " pw; echo
   [[ -z "$pw" ]] && { echo "fastvpn: empty password, not saving" >&2; exit 1; }
@@ -179,7 +214,7 @@ set_password() {
 # prompts for the PIN and returns the decrypted FastVPN password on stdout;
 # all prompts/errors go to stderr so callers can safely capture the output
 get_password() {
-  pass_initialized || { echo "fastvpn: no PIN set yet — run 'fastvpn set-pin' first" >&2; exit 1; }
+  fastvpn_key_ready || { echo "fastvpn: no PIN set yet — run 'fastvpn set-pin' first" >&2; exit 1; }
   entry_exists || { echo "fastvpn: no password stored yet — run 'fastvpn set-password' first" >&2; exit 1; }
   ensure_loopback_pinentry
   forget_cached_pin
@@ -380,6 +415,15 @@ COMMANDS
 
   list                    List configured aliases and what they point to.
 
+  remove <alias>          Delete a configured location: disconnects it if
+                          active, deletes the underlying NetworkManager
+                          connection, and forgets the alias. Use this to
+                          clean up a location that was configured but
+                          never successfully connected (e.g. 'up'/'add'
+                          ran with a bad PIN/password), or one you just
+                          don't want anymore.
+  rm <alias>              Alias for 'remove'.
+
   add <search> [alias]    Pre-configure a location (import + credentials)
                           without connecting to it. <search> matches a
                           saved alias, an exact config filename, or free
@@ -414,6 +458,7 @@ EXAMPLES
   fastvpn up germany           search the catalog; lists matches if ambiguous
   fastvpn pick                 fuzzy-pick from the whole catalog
   fastvpn add "las vegas"      configure Las Vegas without connecting
+  fastvpn remove lasvegas      delete it again (nmcli connection + alias)
   fastvpn down
   fastvpn status
 
@@ -437,6 +482,7 @@ loc="${2:-}"
 case "$action" in
   help|-h|--help) usage; exit 0 ;;
   add)          add_location "${2:-}" "${3:-}"; exit 0 ;;
+  remove|rm)    remove_location "${2:-}"; exit 0 ;;
   set-pin)      set_pin "${2:-}"; exit 0 ;;
   set-password) set_password; exit 0 ;;
   set-username) set_username "${2:-}"; exit 0 ;;
