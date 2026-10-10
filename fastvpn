@@ -399,15 +399,21 @@ COMMANDS
                           tunnel is ever up.
   on [location]           Alias for 'up'.
 
-  down                    Disconnect the current connection.
-  off                     Alias for 'down'.
+  down [location]         Disconnect. With no location: disconnects
+                          whatever's active; if nothing is, just prints
+                          "VPN connection down" (never guesses a location).
+  off [location]          Alias for 'down'.
 
   toggle [location]       Connect if down, disconnect if up. This is the
                           default when no command is given at all. With no
-                          location: acts on whatever's active, else 'slc'.
+                          location: acts on whatever's active, else 'slc'
+                          (toggle is the one command that needs a default
+                          to connect to when nothing at all is active).
 
-  status [location]       Show up/down and the current public IP.
-                          Default location: whatever's active, else 'slc'.
+  status [location]       Show up/down and the current public IP for a
+                          named location. With no location: reports
+                          whatever's active, or "VPN connection down" if
+                          nothing is — never guesses a location.
 
   pick                    Open an interactive fuzzy picker (fzf) over every
                           server in the catalog and connect to the choice.
@@ -511,8 +517,23 @@ case "$action" in
     active "$conn" || nmcli connection up "$conn"
     print_status ;;
   down|off)
-    conn="$([[ -n "$loc" ]] && resolve_or_add "$loc" || default_conn)"
-    nmcli connection down "$conn" ;;
+    if [[ -n "$loc" ]]; then
+      # named explicitly — fine to report it by name either way
+      conn="$(resolve_or_add "$loc")"
+      active "$conn" && nmcli connection down "$conn"
+      print_status
+    else
+      # no location given: only act on whatever's *actually* active, never
+      # a guessed default — otherwise "nothing connected" misreports as
+      # e.g. "Salt Lake City down" even when Salt Lake City was never up
+      conn="$(current_active || true)"
+      if [[ -n "$conn" ]]; then
+        nmcli connection down "$conn"
+        print_status
+      else
+        echo "VPN connection down"
+      fi
+    fi ;;
   toggle)
     conn="$([[ -n "$loc" ]] && resolve_or_add "$loc" || default_conn)"
     if active "$conn"; then
@@ -524,8 +545,17 @@ case "$action" in
     fi
     print_status ;;
   status)
-    conn="$([[ -n "$loc" ]] && resolve_or_add "$loc" || default_conn)"
-    print_status ;;
+    if [[ -n "$loc" ]]; then
+      conn="$(resolve_or_add "$loc")"
+      print_status
+    else
+      conn="$(current_active || true)"
+      if [[ -n "$conn" ]]; then
+        print_status
+      else
+        echo "VPN connection down"
+      fi
+    fi ;;
   *)
     usage >&2
     exit 1 ;;
